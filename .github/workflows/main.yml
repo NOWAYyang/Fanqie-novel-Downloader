@@ -41,8 +41,6 @@ jobs:
 
       - name: 准备下载脚本
         run: |
-- name: 准备下载脚本
-        run: |
           cat > download_novel.py << 'EOF'
           import sys
           import os
