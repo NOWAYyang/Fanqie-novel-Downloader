@@ -1,0 +1,486 @@
+name: 在线下载小说 (仅TXT)
+
+on:
+  workflow_dispatch:
+    inputs:
+      novel_id:
+        description: '小说ID (从番茄小说URL中获取)'
+        required: true
+      threads:
+        description: '下载线程数 (1-5)'
+        required: true
+        default: '3'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  download-novel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v3
+
+      - name: 设置Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: 确保cookie.json存在
+        run: |
+          if [ ! -f "./cookie.json" ]; then
+            echo '""' > "./cookie.json"
+          fi
+
+      - name: 准备下载脚本
+        run: |
+          cat > download_novel.py << 'EOF'
+          import sys
+          import os
+          import time
+          import requests
+          import bs4
+          import re
+          import json
+          import random
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from collections import OrderedDict
+
+          # 小说ID和保存路径
+          novel_id = sys.argv[1]
+          threads_count = int(sys.argv[2])
+          save_path = "novel_output"
+
+          # 确保输出目录存在
+          os.makedirs(save_path, exist_ok=True)
+
+          CONFIG = {
+              "max_workers": threads_count,
+              "max_retries": 5,
+              "request_timeout": 30,
+              "status_file": "chapter.json",
+              "user_agents": [
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
+                  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                  "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
+              ]
+          }
+
+          def get_headers():
+              """生成随机请求头"""
+              return {
+                  "User-Agent": random.choice(CONFIG["user_agents"]),
+                  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                  "Accept-Language": "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2",
+                  "Accept-Encoding": "gzip, deflate, br",
+                  "Connection": "keep-alive",
+                  "Upgrade-Insecure-Requests": "1"
+              }
+
+          def get_cookie():
+              """生成或加载Cookie"""
+              cookie_path = "cookie.json"
+              if os.path.exists(cookie_path):
+                  try:
+                      with open(cookie_path, 'r') as f:
+                          cookie_data = f.read().strip()
+                          if cookie_data and cookie_data != '""':
+                              return cookie_data
+                  except:
+                      pass
+
+              # 生成新Cookie
+              for attempt in range(5):
+                  try:
+                      novel_web_id = random.randint(10**18, 10**19-1)
+                      cookie = f'novel_web_id={novel_web_id}'
+                      
+                      resp = requests.get(
+                          'https://fanqienovel.com',
+                          headers=get_headers(),
+                          cookies={"novel_web_id": str(novel_web_id)},
+                          timeout=10
+                      )
+                      
+                      if resp.ok:
+                          with open(cookie_path, 'w') as f:
+                              json.dump(cookie, f)
+                          print(f"Cookie生成成功 (尝试 {attempt + 1})")
+                          return cookie
+                  except Exception as e:
+                      print(f"Cookie生成失败 {attempt + 1}: {str(e)}")
+                      time.sleep(1)
+              
+              print("使用默认Cookie")
+              return "novel_web_id=1234567890123456789"
+
+          def down_text(chapter_id, chapter_title=""):
+              """下载章节内容 - 多API备用"""
+              max_retries = CONFIG.get('max_retries', 5)
+              content = ""
+
+              # 备用API列表（按优先级排序）
+              api_endpoints = [
+                  {
+                      "name": "官方API",
+                      "url": f"https://fanqienovel.com/api/chapter/{chapter_id}",
+                      "type": "official",
+                      "headers": {
+                          "Referer": f"https://fanqienovel.com/reader/{chapter_id}",
+                          "Accept": "application/json, text/plain, */*",
+                          "X-Requested-With": "XMLHttpRequest"
+                      }
+                  },
+                  {
+                      "name": "备用API-1",
+                      "url": f"https://api.biquge.com.cn/api/fanqie/content.php?item_id={chapter_id}",
+                      "type": "third_party"
+                  },
+                  {
+                      "name": "备用API-2", 
+                      "url": f"https://api.xinruicheng.cn/api/fanqie/content.php?item_id={chapter_id}",
+                      "type": "third_party"
+                  },
+                  {
+                      "name": "备用API-3",
+                      "url": f"https://api.cenguigui.cn/api/tomato/content.php?item_id={chapter_id}",
+                      "type": "third_party"
+                  }
+              ]
+
+              for retry_count in range(max_retries):
+                  try:
+                      # 选择API（轮询方式）
+                      api_info = api_endpoints[retry_count % len(api_endpoints)]
+                      api_url = api_info["url"]
+                      api_name = api_info["name"]
+                      api_type = api_info["type"]
+                      
+                      headers = get_headers()
+                      if "headers" in api_info:
+                          headers.update(api_info["headers"])
+                      
+                      # 添加Cookie
+                      cookie = get_cookie()
+                      if cookie:
+                          headers["Cookie"] = cookie
+                      
+                      print(f"尝试 [{api_name}] 下载章节: {chapter_title or chapter_id}")
+                      
+                      response = requests.get(api_url, headers=headers, timeout=CONFIG["request_timeout"])
+                      
+                      if response.status_code == 200:
+                          if api_type == "official":
+                              # 官方API处理
+                              data = response.json()
+                              content = data.get("data", {}).get("content", "")
+                              
+                              if content:
+                                  # 使用BeautifulSoup清理HTML
+                                  soup = bs4.BeautifulSoup(content, 'html.parser')
+                                  content = soup.get_text(separator='\n')
+                          else:
+                              # 第三方API处理
+                              data = response.json()
+                              if data.get("code") == 200:
+                                  content = data.get("data", {}).get("content", "")
+
+                          # 统一清理内容
+                          if content:
+                              # 移除HTML标签
+                              content = re.sub(r'<header>.*?</header>', '', content, flags=re.DOTALL)
+                              content = re.sub(r'<footer>.*?</footer>', '', content, flags=re.DOTALL)
+                              content = re.sub(r'</?article>', '', content)
+                              content = re.sub(r'<p idx="\d+">', '\n', content)
+                              content = re.sub(r'</p>', '\n', content)
+                              content = re.sub(r'<[^>]+>', '', content)
+                              content = re.sub(r'\\u003c|\\u003e', '', content)
+                              
+                              # 格式化
+                              content = re.sub(r'\n{3,}', '\n\n', content).strip()
+                              content = '\n'.join(['    ' + line if line.strip() else line for line in content.split('\n')])
+                              
+                              print(f"✅ 章节下载成功: {chapter_title or chapter_id}")
+                              break
+                          else:
+                              print(f"⚠️ API返回空内容，尝试下一个...")
+                      else:
+                          print(f"❌ API响应状态码: {response.status_code}")
+                          
+                  except requests.exceptions.RequestException as e:
+                      print(f"❌ 网络请求失败: {str(e)}")
+                  except json.JSONDecodeError as e:
+                      print(f"❌ JSON解析失败: {str(e)}")
+                  except Exception as e:
+                      print(f"❌ 未知错误: {str(e)}")
+                  
+                  # 如果不是最后一次重试，等待后继续
+                  if retry_count < max_retries - 1:
+                      sleep_time = 3 + retry_count * 2  # 递增等待时间
+                      print(f"⏳ 等待 {sleep_time} 秒后重试...")
+                      time.sleep(sleep_time)
+
+              if not content:
+                  print(f"💥 章节下载失败: {chapter_title or chapter_id}")
+                  content = f"【本章节内容获取失败，请稍后重试】\n章节ID: {chapter_id}"
+
+              return content
+
+          def get_book_info(book_id):
+              """获取书名、作者、简介"""
+              url = f'https://fanqienovel.com/page/{book_id}'
+              
+              for attempt in range(3):
+                  try:
+                      headers = get_headers()
+                      cookie = get_cookie()
+                      if cookie:
+                          headers["Cookie"] = cookie
+                      
+                      response = requests.get(url, headers=headers, timeout=20)
+                      
+                      if response.status_code != 200:
+                          print(f"网络请求失败，状态码: {response.status_code}")
+                          continue
+                          
+                      soup = bs4.BeautifulSoup(response.text, 'html.parser')
+
+                      # 获取书名
+                      name_element = soup.find('h1')
+                      name = name_element.text.strip() if name_element else "未知书名"
+
+                      # 获取作者
+                      author_name = "未知作者"
+                      author_element = soup.find('div', class_='author-name')
+                      if author_element:
+                          author_span = author_element.find('span', class_='author-name-text')
+                          if author_span:
+                              author_name = author_span.text.strip()
+
+                      # 获取简介
+                      description = "无简介"
+                      desc_element = soup.find('div', class_='page-abstract-content')
+                      if desc_element:
+                          desc_p = desc_element.find('p')
+                          if desc_p:
+                              description = desc_p.text.strip()
+                          else:
+                              description = desc_element.text.strip()
+
+                      return name, author_name, description
+                      
+                  except Exception as e:
+                      print(f"获取书籍信息失败 {attempt + 1}: {str(e)}")
+                      time.sleep(2)
+              
+              return "未知书名", "未知作者", "无简介"
+
+          def extract_chapters(book_id):
+              """解析章节列表"""
+              url = f'https://fanqienovel.com/page/{book_id}'
+              
+              for attempt in range(3):
+                  try:
+                      headers = get_headers()
+                      cookie = get_cookie()
+                      if cookie:
+                          headers["Cookie"] = cookie
+                      
+                      response = requests.get(url, headers=headers, timeout=20)
+                      
+                      if response.status_code != 200:
+                          continue
+                          
+                      soup = bs4.BeautifulSoup(response.text, 'html.parser')
+                      chapters = []
+
+                      chapter_items = soup.select('div.chapter-item')
+                      if not chapter_items:
+                          print("未找到章节列表，尝试其他选择器...")
+                          chapter_items = soup.select('div[class*="chapter"]')
+
+                      for idx, item in enumerate(chapter_items):
+                          a_tag = item.find('a')
+                          if not a_tag:
+                              continue
+
+                          raw_title = a_tag.get_text(strip=True)
+                          href = a_tag.get('href', '')
+
+                          if not href:
+                              continue
+
+                          # 提取章节ID
+                          chapter_id = href.split('/')[-1]
+                          if not chapter_id or chapter_id == 'page':
+                              continue
+
+                          # 处理章节标题
+                          if re.match(r'^(番外|特别篇|if线)\s*', raw_title):
+                              final_title = raw_title
+                          else:
+                              clean_title = re.sub(
+                                  r'^第[一二三四五六七八九十百千\d]+章\s*',
+                                  '',
+                                  raw_title
+                              ).strip()
+                              final_title = f"第{idx+1}章 {clean_title}"
+
+                          chapters.append({
+                              "id": chapter_id,
+                              "title": final_title,
+                              "url": f"https://fanqienovel.com{href}",
+                              "index": idx
+                          })
+
+                      return chapters
+                      
+                  except Exception as e:
+                      print(f"解析章节列表失败 {attempt + 1}: {str(e)}")
+                      time.sleep(2)
+              
+              return []
+
+          def download_novel(book_id, save_path):
+              """下载小说的主函数"""
+              try:
+                  print("📚 正在获取书籍信息...")
+
+                  # 获取书籍信息
+                  name, author_name, description = get_book_info(book_id)
+                  if not name or name == "未知书名":
+                      raise Exception("无法获取书籍信息，请检查小说ID或网络连接")
+
+                  print(f"📖 书名：《{name}》")
+                  print(f"👤 作者：{author_name}")
+                  print(f"📝 简介：{description}")
+
+                  # 获取章节列表
+                  chapters = extract_chapters(book_id)
+                  if not chapters:
+                      raise Exception("未找到任何章节，可能的小说ID错误或网站结构变化")
+
+                  print(f"✅ 找到 {len(chapters)} 个章节")
+
+                  # 创建输出文件
+                  output_file = os.path.join(save_path, f"{name}.txt")
+                  with open(output_file, 'w', encoding='utf-8') as f:
+                      f.write(f"书名：《{name}》\n作者：{author_name}\n\n简介：\n{description}\n\n")
+                      f.write("=" * 50 + "\n\n")
+
+                  # 下载章节内容
+                  total_chapters = len(chapters)
+                  success_count = 0
+                  content_cache = OrderedDict()
+
+                  print(f"🚀 开始下载章节内容...")
+
+                  def download_single_chapter(chapter):
+                      """下载单个章节"""
+                      content = down_text(chapter["id"], chapter["title"])
+                      return chapter["index"], chapter, content
+
+                  # 使用线程池下载
+                  with ThreadPoolExecutor(max_workers=min(CONFIG["max_workers"], 3)) as executor:
+                      # 提交所有任务
+                      future_to_chapter = {
+                          executor.submit(download_single_chapter, chapter): chapter 
+                          for chapter in chapters
+                      }
+
+                      # 处理完成的任务
+                      for future in as_completed(future_to_chapter):
+                          try:
+                              index, chapter, content = future.result()
+                              if content:
+                                  content_cache[index] = (chapter, content)
+                                  success_count += 1
+                              
+                              # 实时显示进度
+                              progress = (success_count / total_chapters) * 100
+                              print(f"📊 进度: {progress:.1f}% ({success_count}/{total_chapters})")
+                              
+                          except Exception as e:
+                              print(f"❌ 章节处理失败: {str(e)}")
+
+                  # 按顺序写入文件
+                  print("💾 正在保存文件...")
+                  
+                  with open(output_file, 'a', encoding='utf-8') as f:
+                      for index in sorted(content_cache.keys()):
+                          chapter, content = content_cache[index]
+                          f.write(f"{chapter['title']}\n\n")
+                          f.write(content + "\n\n")
+                          f.write("-" * 40 + "\n\n")
+
+                  print(f"✅ 下载完成！成功：{success_count}章，失败：{total_chapters - success_count}章")
+                  print(f"💾 文件保存在：{output_file}")
+                  
+                  # 显示文件大小
+                  file_size = os.path.getsize(output_file) / 1024 / 1024  # MB
+                  print(f"📁 文件大小：{file_size:.2f} MB")
+                  
+                  return True
+
+              except Exception as e:
+                  print(f"💥 错误：{str(e)}")
+                  return False
+
+          # 主程序执行
+          if __name__ == "__main__":
+              print("=" * 60)
+              print("🎬 开始下载小说")
+              print("=" * 60)
+              print(f"📋 小说ID: {novel_id}")
+              print(f"🚀 线程数: {threads_count}")
+              print(f"📁 保存路径: {save_path}")
+              print("=" * 60)
+
+              success = download_novel(novel_id, save_path)
+
+              if success:
+                  print("🎉 下载完成！")
+                  print("\n📋 下载的文件列表:")
+                  for file in os.listdir(save_path):
+                      file_path = os.path.join(save_path, file)
+                      file_size = os.path.getsize(file_path) / 1024  # KB
+                      print(f"   📄 {file} ({file_size:.2f} KB)")
+              else:
+                  print("💥 下载失败！")
+                  sys.exit(1)
+          EOF
+
+      - name: 下载小说
+        run: |
+          echo "🎬 开始下载小说 (TXT格式)..."
+          python download_novel.py "${{ github.event.inputs.novel_id }}" "${{ github.event.inputs.threads }}"
+
+      - name: 压缩下载结果
+        run: |
+          cd novel_output && zip -r ../novel_files.zip .
+
+      - name: 上传下载结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: novel-${{ github.event.inputs.novel_id }}-txt
+          path: novel_files.zip
+          retention-days: 7
+
+      - name: 显示完成信息
+        run: |
+          echo "✅ 小说 TXT 文件下载完成！"
+          echo "📥 请点击上方 'Summary' 标签，然后在 'Artifacts' 部分下载小说文件。"
+          echo "⏳ 文件保存期限为7天。"
+          echo "🔍 如果下载失败，请检查："
+          echo "   - 小说ID是否正确"
+          echo "   - 网络连接是否正常" 
+          echo "   - 尝试减少线程数重新运行"
